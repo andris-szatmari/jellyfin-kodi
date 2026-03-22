@@ -1237,3 +1237,17 @@ msgctxt "#33261"
 msgid "Off"
 msgstr "Off"
 
+msgctxt "#33262"
+msgid "Hide series with no importable episodes"
+msgstr "Hide series with no importable episodes"
+
+msgctxt "#33263"
+msgid "Apply now by updating synced libraries? Empty series will be removed."
+msgstr ""
+"Apply now by updating synced libraries? Empty series will be removed."
+
+msgctxt "#33264"
+msgid "Apply now by updating synced libraries? Previously hidden series may be added back."
+msgstr ""
+"Apply now by updating synced libraries? Previously hidden series may be added "
+"back."

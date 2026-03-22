@@ -66,6 +66,7 @@ class Service(xbmc.Monitor):
             "enableContextTranscode.bool"
         )
         self.settings["kodi_companion"] = settings("kodiCompanion.bool")
+        self.settings["hide_empty_shows"] = settings("hideEmptyShows.bool")
         window("jellyfin_kodiProfile", value=self.settings["profile"])
         settings("platformDetected", client.get_platform())
 
@@ -465,6 +466,30 @@ class Service(xbmc.Monitor):
 
             if not self.settings["kodi_companion"]:
                 dialog("ok", "{jellyfin}", translate(33138))
+
+        hide_empty_shows = settings("hideEmptyShows.bool")
+
+        if hide_empty_shows != self.settings["hide_empty_shows"]:
+            self.settings["hide_empty_shows"] = hide_empty_shows
+            LOG.info(
+                "New hide empty shows setting: %s",
+                self.settings["hide_empty_shows"],
+            )
+
+            if self.library_thread is not None:
+                sync = library.get_sync()
+                libraries = sync.get("Whitelist", [])
+
+                if libraries and dialog(
+                    "yesno",
+                    "{jellyfin}",
+                    (
+                        translate(33263)
+                        if self.settings["hide_empty_shows"]
+                        else translate(33264)
+                    ),
+                ):
+                    self.library_thread.add_library(",".join(libraries), True)
 
     def reload_objects(self):
         """Reload objects which depends on the patch module.

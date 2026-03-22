@@ -365,10 +365,28 @@ class FullSync(object):
     def tvshows(self, library, dialog):
         """Process tvshows and episodes from a single library."""
         processed_ids = []
+        hide_empty = settings("hideEmptyShows.bool")
+        importable_series_ids = set()
+
+        if hide_empty:
+            # Batch the common case once per library. Shows missing from
+            # this direct-ID set are verified individually below to preserve
+            # pooled and grouped series.
+            importable_series_ids = server.get_series_ids_with_importable_episodes(
+                library["Id"]
+            )
 
         for items in server.get_items(
             library["Id"], "Series", False, self.sync["RestorePoint"].get("params")
         ):
+
+            if hide_empty:
+                for show in items["Items"]:
+                    if (
+                        show["Id"] not in importable_series_ids
+                        and server.has_importable_episodes(show["Id"])
+                    ):
+                        importable_series_ids.add(show["Id"])
 
             with self.video_database_locks() as (videodb, jellyfindb):
                 obj = TVShows(
@@ -391,11 +409,19 @@ class FullSync(object):
                         message=message,
                     )
 
+                    if hide_empty and show["Id"] not in importable_series_ids:
+                        LOG.debug(
+                            "SKIP empty show [%s] %s",
+                            show["Id"],
+                            show["Name"],
+                        )
+                        continue
+
                     if obj.tvshow(show) is not False:
 
                         for episodes in server.get_episode_by_show(show["Id"]):
                             for episode in episodes["Items"]:
-                                if episode.get("Path"):
+                                if server.is_importable_episode(episode):
                                     dialog.update(
                                         percent,
                                         message="%s/%s"

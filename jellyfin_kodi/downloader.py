@@ -110,6 +110,76 @@ def get_episode_by_show(show_id):
         yield items
 
 
+def is_importable_episode(episode):
+    """Return whether a raw Jellyfin episode can enter the Kodi import path."""
+    return bool(
+        episode.get("Path")
+        and episode.get("SeriesId")
+        and episode.get("LocationType") != "Virtual"
+    )
+
+
+def has_importable_episodes(show_id):
+    """Return True if the show has at least one importable episode.
+
+    Keep this predicate aligned with the actual episode import path.
+    Path cannot be assumed to exist on every item, as established by #1096.
+    """
+    query = {
+        "url": "Shows/%s/Episodes" % show_id,
+        "params": {
+            "UserId": "{UserId}",
+            "EnableImages": False,
+            "EnableUserData": False,
+            "Fields": "Path",
+            "IsMissing": False,
+        },
+    }
+
+    for items in _get_items(query):
+        for episode in items["Items"]:
+            if is_importable_episode(episode):
+                return True
+
+    return False
+
+
+def get_series_ids_with_importable_episodes(parent_id):
+    """Return series ids that have at least one importable episode.
+
+    Batch this per library during full sync to avoid one extra request
+    per show when hideEmptyShows is enabled. The normal sync page size
+    is tuned for full metadata imports; this scan only needs lightweight
+    episode fields, so use a larger bounded page size to reduce round
+    trips on larger libraries.
+    """
+    query = {
+        "url": "Users/{UserId}/Items",
+        "page_size": 200,
+        "params": {
+            "ParentId": parent_id,
+            "IncludeItemTypes": "Episode",
+            "Recursive": True,
+            "Fields": "Path",
+            "EnableImages": False,
+            "EnableUserData": False,
+            # _get_items enables this only for its initial count request.
+            "EnableTotalRecordCount": False,
+            "IsMissing": False,
+            "IsVirtualUnaired": False,
+            "ExcludeLocationTypes": "Virtual",
+        },
+    }
+    series_ids = set()
+
+    for items in _get_items(query):
+        for episode in items["Items"]:
+            if is_importable_episode(episode):
+                series_ids.add(episode["SeriesId"])
+
+    return series_ids
+
+
 def get_episode_by_season(show_id, season_id):
 
     query = {
@@ -197,26 +267,30 @@ def _get_items(query, server_id=None):
     """query = {
         'url': string,
         'params': dict -- opt, include StartIndex to resume
+        'page_size': int -- opt, override the default page size
     }
     """
     items = {"Items": [], "TotalRecordCount": 0, "RestorePoint": {}}
 
-    limit = min(int(settings("limitIndex") or 50), 50)
+    limit = query.get("page_size")
+
+    if limit is None:
+        limit = min(int(settings("limitIndex") or 50), 50)
+
     dthreads = int(settings("limitThreads") or 3)
 
     url = query["url"]
     query.setdefault("params", {})
     params = query["params"]
 
-    try:
-        test_params = dict(params)
-        test_params["Limit"] = 1
-        test_params["EnableTotalRecordCount"] = True
+    test_params = dict(params)
+    test_params["Limit"] = 1
+    test_params["EnableTotalRecordCount"] = True
 
+    try:
         items["TotalRecordCount"] = _get(url, test_params, server_id=server_id)[
             "TotalRecordCount"
         ]
-
     except Exception as error:
         LOG.exception(
             "Failed to retrieve the server response %s: %s params:%s",
@@ -224,55 +298,60 @@ def _get_items(query, server_id=None):
             error,
             params,
         )
+        raise
 
-    else:
-        params.setdefault("StartIndex", 0)
+    params.setdefault("StartIndex", 0)
 
-        def get_query_params(params, start, count):
-            params_copy = dict(params)
-            params_copy["StartIndex"] = start
-            params_copy["Limit"] = count
-            return params_copy
+    def get_query_params(params, start, count):
+        params_copy = dict(params)
+        params_copy["StartIndex"] = start
+        params_copy["Limit"] = count
+        return params_copy
 
-        query_params = [
-            get_query_params(params, offset, limit)
-            for offset in range(params["StartIndex"], items["TotalRecordCount"], limit)
-        ]
+    query_params = iter(
+        get_query_params(params, offset, limit)
+        for offset in range(params["StartIndex"], items["TotalRecordCount"], limit)
+    )
 
-        # multiprocessing.dummy.Pool completes all requests in multiple threads but has to
-        # complete all tasks before allowing any results to be processed. ThreadPoolExecutor
-        # allows for completed tasks to be processed while other tasks are completed on other
-        # threads. Don't be a dummy.Pool, be a ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(dthreads) as p:
-            # dictionary for storing the jobs and their results
-            jobs = {}
+    # Keep only a bounded window of requests submitted. A replacement is
+    # scheduled after the consumer resumes from yield, preserving backpressure.
+    with concurrent.futures.ThreadPoolExecutor(dthreads) as executor:
+        pending = {}
 
-            # semaphore to avoid fetching complete library to memory
-            thread_buffer = threading.Semaphore(dthreads)
+        def submit_next():
+            try:
+                page_params = next(query_params)
+            except StopIteration:
+                return False
 
-            # wrapper function for _get that uses a semaphore
-            def get_wrapper(params):
-                thread_buffer.acquire()
-                return _get(url, params, server_id=server_id)
+            pending[executor.submit(_get, url, page_params, server_id=server_id)] = (
+                page_params
+            )
+            return True
 
-            # create jobs
-            for param in query_params:
-                job = p.submit(get_wrapper, param)
-                # the query params are later needed again
-                jobs[job] = param
+        for _ in range(dthreads):
+            if not submit_next():
+                break
 
-            # process complete jobs
-            for job in concurrent.futures.as_completed(jobs):
-                # get the result
-                result = job.result() or {"Items": []}
-                query["params"] = jobs[job]
+        try:
+            while pending:
+                completed, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                job = next(iter(completed))
+                page_params = pending.pop(job)
 
-                # free job memory
-                del jobs[job]
-                del job
+                result = job.result()
+
+                if not isinstance(result, dict) or not isinstance(
+                    result.get("Items"), list
+                ):
+                    raise ValueError("Invalid page response from %s" % url)
+
+                query["params"] = page_params
 
                 # Mitigates #216 till the server validates the date provided is valid
-                if result["Items"][0].get("ProductionYear"):
+                if result["Items"] and result["Items"][0].get("ProductionYear"):
                     try:
                         date(result["Items"][0]["ProductionYear"], 1, 1)
                     except ValueError:
@@ -287,9 +366,10 @@ def _get_items(query, server_id=None):
                 items["RestorePoint"] = query
                 yield items
                 del items["Items"][:]
-
-                # release the semaphore again
-                thread_buffer.release()
+                submit_next()
+        finally:
+            for job in pending:
+                job.cancel()
 
 
 class GetItemWorker(threading.Thread):

@@ -16,7 +16,7 @@ from .objects.kodi import Movies as KodiDb
 from .database import Database, jellyfin_db, get_sync, save_sync
 from .full_sync import FullSync
 from .views import Views
-from .downloader import GetItemWorker
+from .downloader import GetItemWorker, has_importable_episodes
 from .helper import translate, api, stop, settings, window, dialog, event, LazyLogger
 from .helper.utils import split_list, set_screensaver, get_screensaver
 from .helper.exceptions import (
@@ -743,6 +743,16 @@ class UpdateWorker(threading.Thread):
                     elif item["Type"] == "BoxSet":
                         movies.boxset(item)
                     elif item["Type"] == "Series":
+                        if settings("hideEmptyShows.bool"):
+                            if not has_importable_episodes(item["Id"]):
+                                LOG.debug(
+                                    "SKIP empty show (incremental) "
+                                    "[%s] %s",
+                                    item["Id"],
+                                    item["Name"],
+                                )
+                                tvshows.remove(item["Id"])
+                                continue
                         tvshows.tvshow(item)
                     elif item["Type"] == "Season":
                         tvshows.season(item)
@@ -772,8 +782,8 @@ class UpdateWorker(threading.Thread):
                     LOG.warning("Ignoring exception %s", error)
                 except Exception as error:
                     LOG.exception(error)
-
-                self.queue.task_done()
+                finally:
+                    self.queue.task_done()
 
                 if window("jellyfin_should_stop.bool"):
                     break

@@ -95,6 +95,11 @@
 					<default>true</default>
 					<control type="toggle"/>
 				</setting>
+				<setting id="hideEmptyShows" type="boolean" label="33262" help="">
+					<level>0</level>
+					<default>false</default>
+					<control type="toggle"/>
+				</setting>
 			</group>
 			<group id="2" label="33111">
 				<setting id="useDirectPaths" type="integer" label="30511" help="">

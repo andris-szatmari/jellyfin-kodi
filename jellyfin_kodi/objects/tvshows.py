@@ -320,22 +320,16 @@ class TVShows(KodiDb):
         Create additional entry for widgets.
         This is only required for plugin/episode.
         """
+        if not server.is_importable_episode(item):
+            LOG.info("Skipping non-importable episode %s", item.get("Id"))
+            return
+
         server_address = self.server.auth.get_server_info(self.server.auth.server_id)[
             "address"
         ]
         API = api.API(item, server_address)
         obj = self.objects.map(item, "Episode")
         update = True
-
-        if obj["Location"] == "Virtual":
-            LOG.info("Skipping virtual episode %s: %s", obj["Title"], obj["Id"])
-
-            return
-
-        elif obj["SeriesId"] is None:
-            LOG.info("Skipping episode %s with missing SeriesId", obj["Id"])
-
-            return
 
         try:
             obj["EpisodeId"] = e_item[0]
