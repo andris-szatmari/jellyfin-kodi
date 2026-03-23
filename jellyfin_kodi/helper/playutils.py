@@ -30,6 +30,15 @@ class Transcode(object):
 
 #################################################################################################
 
+RESUME_INTENT_NONE = "none"
+RESUME_INTENT_RESUME = "resume"
+RESUME_INTENT_STARTOVER = "startover"
+RESUME_PROMPT_SOURCE_NATIVE = "jellyfin-native-dialog"
+RESUME_PROMPT_SOURCE_KODI = "kodi-native-resume-arg"
+
+
+#################################################################################################
+
 
 def set_properties(item, method, server_id=None):
     """Set all properties for playback detection."""
@@ -53,6 +62,12 @@ def set_properties(item, method, server_id=None):
             "SubtitleStreamIndex": info.get("SubtitleStreamIndex"),
             "CurrentPosition": info.get("CurrentPosition"),
             "CurrentEpisode": info.get("CurrentEpisode"),
+            "ResumeIntent": info.get("ResumeIntent", item.get("ResumeIntent")),
+            "RequestedStartOffset": info.get(
+                "RequestedStartOffset", item.get("RequestedStartOffset")
+            ),
+            "ForceInitialSeek": info.get("ForceInitialSeek", item.get("ForceInitialSeek")),
+            "PromptSource": info.get("PromptSource", item.get("PromptSource")),
         }
     )
 

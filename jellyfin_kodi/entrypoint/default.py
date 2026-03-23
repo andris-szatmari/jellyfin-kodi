@@ -104,7 +104,12 @@ class Events(object):
         elif mode == "play":
 
             item = api_client.get_item(params["id"])
-            item["resumePlayback"] = sys.argv[3].split(":")[1] == "true"
+            resume_arg = sys.argv[3] if len(sys.argv) > 3 else ""
+            LOG.debug(
+                "[ play ] resume arg: %s server ticks=%s",
+                resume_arg,
+                item.get("UserData", {}).get("PlaybackPositionTicks"),
+            )
             Actions(server, api_client).play(
                 item,
                 params.get("dbid"),

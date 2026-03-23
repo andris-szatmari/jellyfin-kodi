@@ -9,6 +9,20 @@ from pathlib import Path
 
 import yaml
 
+RUNTIME_TOP_LEVEL_FILES = (
+    "addon.xml",
+    "service.py",
+    "default.py",
+    "context.py",
+    "context_play.py",
+    "LICENSE.txt",
+)
+RUNTIME_TOP_LEVEL_DIRS = (
+    "resources",
+    "jellyfin_kodi",
+    "typings",
+)
+
 
 def indent(elem: ET.Element, level: int = 0) -> None:
     """
@@ -68,16 +82,14 @@ def zip_files(py_version: str, source: str, target: str, dev: bool) -> None:
     Create installable addon zip archive
     """
     archive_name = "plugin.video.jellyfin+{}.zip".format(py_version)
+    archive_path = os.path.join(target, archive_name)
 
-    with zipfile.ZipFile("{}/{}".format(target, archive_name), "w") as z:
-        for root, dirs, files in os.walk(args.source):
-            for filename in filter(file_filter, files):
-                file_path = os.path.join(root, filename)
-                if dev or folder_filter(file_path):
-                    relative_path = os.path.join(
-                        "plugin.video.jellyfin", os.path.relpath(file_path, source)
-                    )
-                    z.write(file_path, relative_path)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for relative_path in iter_runtime_files(source, dev):
+            z.write(
+                os.path.join(source, relative_path),
+                os.path.join("plugin.video.jellyfin", relative_path),
+            )
 
 
 def file_filter(file_name: str) -> bool:
@@ -91,13 +103,29 @@ def file_filter(file_name: str) -> bool:
         and not file_name.endswith(".pyo")
         and not file_name.endswith(".pyc")
         and not file_name.endswith(".pyd")
+        and file_name != ".DS_Store"
+        and file_name != "AGENTS.md"
+        and file_name != "release.yaml"
     )
 
 
-def folder_filter(folder_name: str) -> bool:
+def runtime_filter(path_name: str, source: str) -> bool:
+    """
+    True if path_name is part of the addon runtime payload.
+    """
+    relative_path = os.path.relpath(path_name, source)
+    top_level = relative_path.split(os.path.sep, 1)[0]
+
+    return top_level in RUNTIME_TOP_LEVEL_FILES or top_level in RUNTIME_TOP_LEVEL_DIRS
+
+
+def folder_filter(folder_name: str, source: str) -> bool:
     """
     True if folder_name is meant to be included
     """
+    if not runtime_filter(folder_name, source):
+        return False
+
     filters = [
         ".ci",
         ".git",
@@ -105,13 +133,43 @@ def folder_filter(folder_name: str) -> bool:
         ".build",
         ".mypy_cache",
         ".pytest_cache",
+        ".venv",
+        ".vscode",
         "__pycache__",
+        "downloads",
+        "tests",
     ]
     for f in filters:
         if f in folder_name.split(os.path.sep):
             return False
 
     return True
+
+
+def iter_runtime_files(source: str, dev: bool):
+    """
+    Yield addon runtime files relative to source.
+    """
+    for top_level_file in RUNTIME_TOP_LEVEL_FILES:
+        if file_filter(top_level_file):
+            yield top_level_file
+
+    for top_level_dir in RUNTIME_TOP_LEVEL_DIRS:
+        root_dir = os.path.join(source, top_level_dir)
+
+        for root, dirs, files in os.walk(root_dir):
+            if not dev:
+                dirs[:] = [
+                    directory
+                    for directory in dirs
+                    if folder_filter(os.path.join(root, directory), source)
+                ]
+
+            for filename in filter(file_filter, files):
+                file_path = os.path.join(root, filename)
+
+                if dev or folder_filter(file_path, source):
+                    yield os.path.relpath(file_path, source)
 
 
 if __name__ == "__main__":

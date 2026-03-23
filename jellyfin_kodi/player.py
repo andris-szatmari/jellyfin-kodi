@@ -4,12 +4,14 @@ from __future__ import division, absolute_import, print_function, unicode_litera
 #################################################################################################
 
 import os
+import threading
 
 import xbmc
 import xbmcvfs
 
 from .objects.obj import Objects
 from .helper import translate, api, window, settings, dialog, event, JSONRPC
+from .helper import playutils
 from .jellyfin import Jellyfin
 from .helper import LazyLogger
 from .helper.utils import translate_path
@@ -23,6 +25,11 @@ LOG = LazyLogger(__name__)
 
 class Player(xbmc.Player):
 
+    INITIAL_SEEK_DELAY = 0.5
+    INITIAL_SEEK_RETRIES = 8
+    INITIAL_SEEK_TOLERANCE = 2
+    INITIAL_SEEK_NEAR_START = 15
+
     played = {}
     up_next = False
     skip_segments = {}
@@ -31,6 +38,7 @@ class Player(xbmc.Player):
 
     def __init__(self):
         xbmc.Player.__init__(self)
+        self._initial_seek_generation = 0
 
     def get_playing_file(self):
         try:
@@ -122,6 +130,7 @@ class Player(xbmc.Player):
         except Exception as e:
             LOG.warning("Failed to report session playing: %s", e)
         window("jellyfin.skip.%s.bool" % item["Id"], True)
+        self.schedule_initial_seek(current_file)
 
         # Immediate skip check for segments starting at 0:00
         if settings("mediaSegmentsEnabled.bool"):
@@ -161,11 +170,15 @@ class Player(xbmc.Player):
         result = result.get("result", {})
         volume = result.get("volume")
         muted = result.get("muted")
+        current_position = item.get("CurrentPosition")
+
+        if current_position is None:
+            current_position = int(seektime)
 
         item.update(
             {
                 "File": file,
-                "CurrentPosition": item.get("CurrentPosition") or int(seektime),
+                "CurrentPosition": current_position,
                 "Muted": muted,
                 "Volume": volume,
                 "Server": Jellyfin(item["ServerId"]).get_client(),
@@ -175,6 +188,166 @@ class Player(xbmc.Player):
 
         self.played[file] = item
         LOG.info("-->[ play/%s ] %s", item["Id"], item)
+
+    @classmethod
+    def get_initial_seek_target(cls, item):
+        intent = item.get("ResumeIntent")
+
+        if intent not in (
+            playutils.RESUME_INTENT_RESUME,
+            playutils.RESUME_INTENT_STARTOVER,
+        ):
+            return None
+
+        target = item.get("RequestedStartOffset")
+
+        if target is None and intent == playutils.RESUME_INTENT_STARTOVER:
+            return 0
+
+        if target is None:
+            return None
+
+        return float(target)
+
+    @classmethod
+    def is_initial_seek_satisfied(cls, current_position, target_position):
+        return (
+            abs(float(current_position) - float(target_position))
+            <= cls.INITIAL_SEEK_TOLERANCE
+        )
+
+    def schedule_initial_seek(self, current_file):
+        if not self.is_playing_file(current_file):
+            return
+
+        item = self.get_file_info(current_file)
+        if not item:
+            return
+
+        target = self.get_initial_seek_target(item)
+
+        if target is None or not item.get("ForceInitialSeek"):
+            return
+
+        self._initial_seek_generation += 1
+        generation = self._initial_seek_generation
+        worker = threading.Thread(
+            target=self._apply_initial_seek,
+            args=(current_file, generation),
+            name="JellyfinInitialSeek",
+        )
+        worker.daemon = True
+        worker.start()
+
+    def _apply_initial_seek(self, current_file, generation=None, monitor=None):
+        if monitor is None:
+            monitor = xbmc.Monitor()
+
+        if monitor.waitForAbort(self.INITIAL_SEEK_DELAY):
+            return
+
+        for _ in range(self.INITIAL_SEEK_RETRIES):
+            if generation is not None and generation != self._initial_seek_generation:
+                return
+
+            if not self.is_playing_file(current_file):
+                return
+
+            try:
+                if self.get_playing_file() != current_file:
+                    return
+            except Exception:
+                return
+
+            item = self.get_file_info(current_file)
+            if not item:
+                return
+
+            target = self.get_initial_seek_target(item)
+
+            if target is None:
+                item["ForceInitialSeek"] = False
+                return
+
+            try:
+                current_position = float(self.getTime())
+            except Exception as error:
+                LOG.debug("Initial seek position unavailable: %s", error)
+
+                if monitor.waitForAbort(self.INITIAL_SEEK_DELAY):
+                    return
+
+                continue
+
+            if self.is_initial_seek_satisfied(current_position, target):
+                item["CurrentPosition"] = int(target)
+                item["ForceInitialSeek"] = False
+                return
+
+            # Skip seeking to 0 if playback is already near the start,
+            # following PKC's approach to avoid a visible jump.
+            if target == 0 and current_position < self.INITIAL_SEEK_NEAR_START:
+                item["CurrentPosition"] = 0
+                item["ForceInitialSeek"] = False
+                LOG.debug(
+                    "Skipping seek-to-zero for %s, already at %.1fs",
+                    item["Id"],
+                    current_position,
+                )
+                return
+
+            result = self._jsonrpc_seek(target)
+
+            if result is not None and "error" not in result:
+                item["CurrentPosition"] = int(target)
+                item["ForceInitialSeek"] = False
+                LOG.info(
+                    "Applying initial seek for %s from %.3f to %.3f",
+                    item["Id"],
+                    current_position,
+                    target,
+                )
+                return
+
+            LOG.debug("Initial seek returned: %s", result)
+
+            if monitor.waitForAbort(self.INITIAL_SEEK_DELAY):
+                return
+
+        if self.is_playing_file(current_file):
+            self.get_file_info(current_file)["ForceInitialSeek"] = False
+            LOG.warning("Initial seek retries exhausted for %s", current_file)
+
+    @staticmethod
+    def _jsonrpc_seek(offset_seconds):
+        """Seek the active video player to *offset_seconds* via JSON-RPC.
+
+        JSON-RPC Player.Seek is more reliable than xbmc.Player.seekTime()
+        because it returns success/error status and is not silently overridden
+        by Kodi's own auto-resume.
+        """
+        hours = int(offset_seconds // 3600)
+        minutes = int((offset_seconds % 3600) // 60)
+        seconds = int(offset_seconds % 60)
+        millis = int((offset_seconds * 1000) % 1000)
+        try:
+            result = JSONRPC("Player.Seek").execute(
+                {
+                    "playerid": 1,
+                    "value": {
+                        "time": {
+                            "hours": hours,
+                            "minutes": minutes,
+                            "seconds": seconds,
+                            "milliseconds": millis,
+                        }
+                    },
+                }
+            )
+            return result.get("result") if result else None
+        except Exception as error:
+            LOG.debug("JSON-RPC seek failed: %s", error)
+            return None
 
     def set_audio_subs(self, audio=None, subtitle=None):
         if audio:
@@ -424,6 +597,22 @@ class Player(xbmc.Player):
         self.stop_playback()
         LOG.info("--<<[ playback ]")
 
+    def refresh_stop_position(self, item):
+        """Best-effort refresh of the stop position from Kodi before session_stop."""
+        try:
+            current_file = self.get_playing_file()
+        except Exception as error:
+            LOG.debug("Failed to resolve playing file on stop: %s", error)
+            return
+
+        if current_file != item.get("File"):
+            return
+
+        try:
+            item["CurrentPosition"] = int(self.getTime())
+        except Exception as error:
+            LOG.debug("Failed to refresh playback position on stop: %s", error)
+
     def stop_playback(self):
         """Stop all playback. Check for external player for positionticks."""
         if not self.played:
@@ -441,6 +630,8 @@ class Player(xbmc.Player):
 
                 if int(item["CurrentPosition"]) == 1:
                     item["CurrentPosition"] = int(item["Runtime"])
+            else:
+                self.refresh_stop_position(item)
 
             data = {
                 "ItemId": item["Id"],

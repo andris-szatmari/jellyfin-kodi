@@ -101,7 +101,7 @@ class MusicVideos(KodiDb):
             else Local(obj["DatePlayed"]).split(".")[0].replace("T", " ")
         )
         obj["PlayCount"] = API.get_playcount(obj["Played"], obj["PlayCount"])
-        obj["Resume"] = API.adjust_resume((obj["Resume"] or 0) / 10000000.0)
+        obj["Resume"] = API.resume_seconds(obj["Resume"])
         obj["Runtime"] = round(float((obj["Runtime"] or 0) / 10000000.0), 6)
         obj["Premiere"] = (
             Local(obj["Premiere"])
@@ -233,7 +233,7 @@ class MusicVideos(KodiDb):
         except TypeError:
             return
 
-        obj["Resume"] = API.adjust_resume((obj["Resume"] or 0) / 10000000.0)
+        obj["Resume"] = API.resume_seconds(obj["Resume"])
         obj["Runtime"] = round(float((obj["Runtime"] or 0) / 10000000.0), 6)
         obj["PlayCount"] = API.get_playcount(obj["Played"], obj["PlayCount"])
 

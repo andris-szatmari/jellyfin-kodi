@@ -158,6 +158,13 @@ class API(object):
         return runtime
 
     @classmethod
+    def resume_seconds(cls, resume_ticks):
+        if not resume_ticks:
+            return 0
+
+        return round(float(resume_ticks) / 10000000.0, 6)
+
+    @classmethod
     def adjust_resume(cls, resume_seconds):
 
         resume = 0

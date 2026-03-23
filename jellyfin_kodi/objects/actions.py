@@ -11,10 +11,8 @@ from datetime import timedelta
 import xbmc
 import xbmcgui
 import xbmcplugin
-import xbmcaddon
 
 from ..helper import translate, playutils, api, window, settings, dialog
-from ..dialogs import resume
 from ..helper import LazyLogger
 from ..jellyfin import Jellyfin
 from ..helper.utils import translate_path
@@ -78,7 +76,9 @@ class Actions(object):
         source = play.select_source(play.get_sources())
         play.set_external_subs(source, listitem)
 
-        self.set_playlist(item, listitem, db_id, transcode)
+        if not self.set_playlist(item, listitem, db_id, transcode):
+            self.cancel_playback()
+            return
 
         # Using playlist approach for Cinema mode
         if len(self.stack) > 1:
@@ -94,29 +94,143 @@ class Actions(object):
         Detect the seektime for video type content.
         Verify the default video action set in Kodi for accurate resume behavior.
         """
+        if not self.resolve_resume_intent(item):
+            return False
 
-        if item["MediaType"] in ("Video", "Audio"):
-            resume = item["UserData"].get("PlaybackPositionTicks")
+        LOG.info(
+            "[ resume ] intent=%s requested_offset=%s item_ticks=%s playback_position=%s",
+            item.get("ResumeIntent"),
+            item.get("RequestedStartOffset"),
+            item.get("UserData", {}).get("PlaybackPositionTicks"),
+            item.get("PlaybackInfo", {}).get("CurrentPosition"),
+        )
 
-            if resume and transcode:
-                choice = self.resume_dialog(
-                    api.API(item, self.server).adjust_resume((resume or 0) / 10000000.0)
-                )
-
-                if choice is None:
-                    raise Exception("User backed out of resume dialog.")
-
-                item["resumePlayback"] = bool(choice)
-
-        if settings("enableCinema.bool") and not item["resumePlayback"]:
+        if (
+            settings("enableCinema.bool")
+            and item.get("ResumeIntent") != playutils.RESUME_INTENT_RESUME
+        ):
             self._set_intros(item)
 
-        self.set_listitem(item, listitem, db_id, None)
+        self.set_listitem(
+            item,
+            listitem,
+            db_id,
+            item.get("ResumeIntent") == playutils.RESUME_INTENT_RESUME,
+        )
         playutils.set_properties(item, item["PlaybackInfo"]["Method"], self.server_id)
         self.stack.append([item["PlaybackInfo"]["Path"], listitem])
 
         if item.get("PartCount"):
             self._set_additional_parts(item["Id"])
+
+        return True
+
+    @staticmethod
+    def cancel_playback():
+        LOG.info("Cancel playback before stream start.")
+
+        if len(sys.argv) > 1:
+            xbmcplugin.setResolvedUrl(int(sys.argv[1]), False, xbmcgui.ListItem())
+
+    def resolve_resume_intent(self, item):
+        requested_start_offset = None
+        prompt_source = None
+        intent = playutils.RESUME_INTENT_NONE
+        resume_seconds = self.get_resume_seconds(item)
+        kodi_resume_arg = self.get_kodi_resume_arg()
+
+        if resume_seconds and kodi_resume_arg == "resume:true":
+            LOG.info("Using Kodi native resume arg: %s", kodi_resume_arg)
+            prompt_source = playutils.RESUME_PROMPT_SOURCE_KODI
+            intent = playutils.RESUME_INTENT_RESUME
+            requested_start_offset = resume_seconds
+        elif resume_seconds and kodi_resume_arg == "resume:false":
+            LOG.info(
+                "Kodi native resume arg is %s; treating as explicit start-over.",
+                kodi_resume_arg,
+            )
+            prompt_source = playutils.RESUME_PROMPT_SOURCE_KODI
+            intent = playutils.RESUME_INTENT_STARTOVER
+            requested_start_offset = 0
+        elif resume_seconds:
+            prompt_source = playutils.RESUME_PROMPT_SOURCE_NATIVE
+            intent = self.prompt_resume_intent(resume_seconds)
+
+            if intent is None:
+                LOG.info("User cancelled native resume prompt.")
+                return False
+
+            if intent == playutils.RESUME_INTENT_RESUME:
+                requested_start_offset = resume_seconds
+            elif intent == playutils.RESUME_INTENT_STARTOVER:
+                requested_start_offset = 0
+
+        self.apply_resume_intent(
+            item, intent, requested_start_offset, prompt_source=prompt_source
+        )
+
+        return True
+
+    @staticmethod
+    def get_kodi_resume_arg():
+        if len(sys.argv) <= 3:
+            return None
+
+        resume_arg = (sys.argv[3] or "").strip().lower()
+
+        if resume_arg in ("resume:true", "resume:false"):
+            return resume_arg
+
+        return None
+
+    def get_resume_seconds(self, item):
+        if item.get("MediaType") not in ("Video", "Audio"):
+            return 0
+
+        resume_ticks = item.get("UserData", {}).get("PlaybackPositionTicks") or 0
+
+        return api.API(item, self.server).adjust_resume(resume_ticks / 10000000.0)
+
+    @staticmethod
+    def apply_resume_intent(
+        item,
+        intent,
+        requested_start_offset=None,
+        force_initial_seek=None,
+        prompt_source=None,
+    ):
+        playback_info = item.setdefault("PlaybackInfo", {})
+
+        if force_initial_seek is None:
+            force_initial_seek = intent in (
+                playutils.RESUME_INTENT_RESUME,
+                playutils.RESUME_INTENT_STARTOVER,
+            )
+
+        item["ResumeIntent"] = intent
+        item["RequestedStartOffset"] = requested_start_offset
+        item["ForceInitialSeek"] = bool(force_initial_seek)
+        item["PromptSource"] = prompt_source
+        item["resumePlayback"] = intent == playutils.RESUME_INTENT_RESUME
+
+        playback_info["ResumeIntent"] = intent
+
+        if requested_start_offset is None:
+            playback_info.pop("CurrentPosition", None)
+            playback_info.pop("RequestedStartOffset", None)
+        else:
+            playback_info["CurrentPosition"] = requested_start_offset
+            playback_info["RequestedStartOffset"] = requested_start_offset
+
+        if force_initial_seek:
+            playback_info["ForceInitialSeek"] = True
+        else:
+            playback_info.pop("ForceInitialSeek", None)
+
+        if prompt_source:
+            playback_info["PromptSource"] = prompt_source
+        else:
+            playback_info.pop("PromptSource", None)
 
     def _set_intros(self, item):
         """if we have any play them when the movie/show is not being resumed."""
@@ -245,8 +359,24 @@ class Actions(object):
         LOG.info("[ playlist/%s ] %s", item["Id"], item["Name"])
 
         # Automatically resume if the item is in progress (casting from server)
-        resume = item["UserData"].get("PlaybackPositionTicks")
-        item["resumePlayback"] = bool(resume)
+        requested_start_offset = None
+        resume_ticks = item.get("UserData", {}).get("PlaybackPositionTicks")
+
+        if seektime:
+            requested_start_offset = round(float(seektime) / 10000000.0, 6)
+        elif resume_ticks:
+            requested_start_offset = api.API(item, self.server).adjust_resume(
+                (resume_ticks or 0) / 10000000.0
+            )
+
+        self.apply_resume_intent(
+            item,
+            playutils.RESUME_INTENT_RESUME
+            if requested_start_offset
+            else playutils.RESUME_INTENT_NONE,
+            requested_start_offset=requested_start_offset,
+            force_initial_seek=bool(requested_start_offset),
+        )
 
         play = playutils.PlayUtils(
             item, False, self.server_id, self.server, self.api_client
@@ -261,7 +391,7 @@ class Actions(object):
             "PlaybackInfo"
         ].get("SubtitleStreamIndex")
 
-        self.set_listitem(item, listitem, None, True if seektime else False)
+        self.set_listitem(item, listitem, None, bool(requested_start_offset))
         listitem.setPath(item["PlaybackInfo"]["Path"])
         playutils.set_properties(item, item["PlaybackInfo"]["Method"], self.server_id)
 
@@ -339,7 +469,11 @@ class Actions(object):
 
             if "PlaybackInfo" in item:
 
-                if seektime:
+                requested_start_offset = item.get("RequestedStartOffset")
+
+                if requested_start_offset is not None:
+                    item["PlaybackInfo"]["CurrentPosition"] = requested_start_offset
+                elif seektime:
                     item["PlaybackInfo"]["CurrentPosition"] = obj["Resume"]
 
                 if "SubtitleUrl" in item["PlaybackInfo"]:
@@ -558,12 +692,12 @@ class Actions(object):
             listitem.setProperty("totaltime", str(obj["Runtime"]))
             listitem.setProperty("IsPlayable", "true")
             listitem.setProperty("IsFolder", "false")
-
-            if obj["Resume"] and item.get("resumePlayback"):
-                listitem.setProperty("resumetime", str(obj["Resume"]))
-            else:
-                listitem.setProperty("resumetime", "0")
-                listitem.setProperty("StartPercent", "0")
+            self.set_resume_properties(
+                listitem,
+                obj["Resume"],
+                obj["Runtime"],
+                item.get("ResumeIntent", playutils.RESUME_INTENT_NONE),
+            )
 
             for track in obj["Streams"]["video"]:
                 listitem.addStreamInfo(
@@ -589,6 +723,36 @@ class Actions(object):
         listitem.setLabel(obj["Title"])
         listitem.setInfo("video", metadata)
         listitem.setContentLookup(False)
+
+    @staticmethod
+    def set_resume_properties(listitem, resume_time, runtime, resume_intent):
+        """Set resume-related properties on the listitem.
+
+        We deliberately do NOT set StartOffset here. Kodi's handling of
+        StartOffset races with its own bookmark-based auto-resume and with
+        our explicit post-start seek.  Following PKC's approach, the actual
+        playback position is enforced entirely by the initial-seek thread
+        in player.py after playback starts.
+        """
+        if resume_time and resume_intent == playutils.RESUME_INTENT_RESUME:
+            try:
+                listitem.getVideoInfoTag().setResumePoint(resume_time, runtime)
+            except Exception as error:
+                LOG.debug("Failed to set resume point on info tag: %s", error)
+
+            listitem.setProperty("resumetime", str(resume_time))
+
+            return
+
+        if resume_intent == playutils.RESUME_INTENT_STARTOVER:
+            try:
+                listitem.getVideoInfoTag().setResumePoint(0, runtime)
+            except Exception as error:
+                LOG.debug("Failed to clear resume point on info tag: %s", error)
+
+            listitem.setProperty("resumetime", "0")
+
+            return
 
     def listitem_channel(self, obj, listitem, item):
         """Set listitem for channel content."""
@@ -822,29 +986,23 @@ class Actions(object):
         else:
             listitem.setArt({art: path})
 
-    def resume_dialog(self, seektime):
-        """Base resume dialog based on Kodi settings."""
-        LOG.info("Resume dialog called.")
-        XML_PATH = (
-            xbmcaddon.Addon("plugin.video.jellyfin").getAddonInfo("path"),
-            "default",
-            "1080i",
+    def prompt_resume_intent(self, seektime):
+        LOG.info("Native resume prompt called.")
+
+        selection = xbmcgui.Dialog().contextmenu(
+            [
+                "Resume from %s" % str(timedelta(seconds=seektime)).split(".")[0],
+                "Start from beginning",
+            ]
         )
 
-        dialog = resume.ResumeDialog("script-jellyfin-resume.xml", *XML_PATH)
-        dialog.set_resume_point(
-            "Resume from %s" % str(timedelta(seconds=seektime)).split(".")[0]
-        )
-        dialog.doModal()
+        if selection == 0:
+            return playutils.RESUME_INTENT_RESUME
 
-        if dialog.is_selected():
-            if not dialog.get_selected():  # Start from beginning selected.
-                return False
-        else:  # User backed out
-            LOG.info("User exited without a selection.")
-            return
+        if selection == 1:
+            return playutils.RESUME_INTENT_STARTOVER
 
-        return True
+        return None
 
 
 class PlaylistWorker(threading.Thread):

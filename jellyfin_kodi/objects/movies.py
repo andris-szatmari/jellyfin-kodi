@@ -97,7 +97,7 @@ class Movies(KodiDb):
         obj["Directors"] = " / ".join(obj["Directors"] or [])
         obj["Plot"] = API.get_overview(obj["Plot"])
         obj["Mpaa"] = API.get_mpaa(obj["Mpaa"])
-        obj["Resume"] = API.adjust_resume((obj["Resume"] or 0) / 10000000.0)
+        obj["Resume"] = API.resume_seconds(obj["Resume"])
         obj["Runtime"] = round(float((obj["Runtime"] or 0) / 10000000.0), 6)
         obj["People"] = API.get_people_artwork(obj["People"])
         obj["DateAdded"] = Local(obj["DateAdded"]).split(".")[0].replace("T", " ")
@@ -362,7 +362,7 @@ class Movies(KodiDb):
         except TypeError:
             return
 
-        obj["Resume"] = API.adjust_resume((obj["Resume"] or 0) / 10000000.0)
+        obj["Resume"] = API.resume_seconds(obj["Resume"])
         obj["Runtime"] = round(float((obj["Runtime"] or 0) / 10000000.0), 6)
         obj["PlayCount"] = API.get_playcount(obj["Played"], obj["PlayCount"])
 
