@@ -191,8 +191,12 @@ class Monitor(xbmc.Monitor):
     def server_instance(self, server_id=None):
 
         server = Jellyfin(server_id).get_client()
-        session = server.jellyfin.get_device(self.device_id)
-        server.config.data["app.session"] = session[0]["Id"]
+        session = self.get_device_session(server)
+
+        if not session:
+            return
+
+        server.config.data["app.session"] = session["Id"]
 
         if server_id is not None:
             self.servers.append(server_id)
@@ -216,14 +220,12 @@ class Monitor(xbmc.Monitor):
         for i in range(10):
             window("JellyfinAdditionalUserImage.%s" % i, clear=True)
 
-        try:
-            session = server.jellyfin.get_device(self.device_id)
-        except Exception as error:
-            LOG.exception(error)
+        session = self.get_device_session(server)
 
+        if not session:
             return
 
-        for index, user in enumerate(session[0]["AdditionalUsers"]):
+        for index, user in enumerate(session.get("AdditionalUsers", [])):
 
             info = server.jellyfin.get_user(user["UserId"])
             image = api.API(info, server.config.data["auth.server"]).get_user_artwork(
@@ -231,6 +233,23 @@ class Monitor(xbmc.Monitor):
             )
             window("JellyfinAdditionalUserImage.%s" % index, image)
             window("JellyfinAdditionalUserPosition.%s" % user["UserId"], str(index))
+
+    def get_device_session(self, server):
+
+        try:
+            session = server.jellyfin.get_device(self.device_id) or []
+        except Exception as error:
+            LOG.exception(error)
+            return None
+
+        if not session:
+            LOG.warning(
+                "No active Jellyfin session for device %s while loading server state.",
+                self.device_id,
+            )
+            return None
+
+        return session[0]
 
     def playstate(self, data):
         """Jellyfin playstate updates."""
