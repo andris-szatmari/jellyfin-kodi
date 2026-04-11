@@ -378,6 +378,10 @@ class Service(xbmc.Monitor):
         elif method == "System.OnSleep":
 
             LOG.info("-->[ sleep ]")
+
+            if self.monitor and getattr(self.monitor, "player", None):
+                self.monitor.player.store_sleep_resume_candidate()
+
             window("jellyfin_should_stop.bool", True)
 
             if self.library_thread is not None:

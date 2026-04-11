@@ -29,6 +29,9 @@ class Player(xbmc.Player):
     INITIAL_SEEK_RETRIES = 8
     INITIAL_SEEK_TOLERANCE = 2
     INITIAL_SEEK_NEAR_START = 15
+    SLEEP_RESUME_STATE_KEY = "jellyfin_sleep_resume.json"
+    SLEEP_RESUME_ACTIVE_KEY = "jellyfin_sleep_resume_active.bool"
+    SLEEP_RESUME_PROMPT_SOURCE = "sleep-wake-recovery"
 
     played = {}
     up_next = False
@@ -87,12 +90,16 @@ class Player(xbmc.Player):
         items = window("jellyfin_play.json")
         item = None
 
-        while not items:
+        if not items:
+            item = self.recover_sleep_resume_item(current_file)
+
+        while not items and item is None:
 
             if monitor.waitForAbort(2):
                 return
 
             items = window("jellyfin_play.json")
+            item = self.recover_sleep_resume_item(current_file)
             count += 1
 
             if count == 20:
@@ -100,15 +107,24 @@ class Player(xbmc.Player):
 
                 return
 
-        for item in items:
-            if item["Path"] == current_file:
-                items.pop(items.index(item))
+        if item is None:
+            self.clear_sleep_resume_candidate()
 
-                break
+            for item in items:
+                if item["Path"] == current_file:
+                    items.pop(items.index(item))
+
+                    break
+            else:
+                item = items.pop(0)
+
+            window("jellyfin_play.json", items)
         else:
-            item = items.pop(0)
-
-        window("jellyfin_play.json", items)
+            LOG.info(
+                "Recovered sleep resume playback for %s at %s",
+                item["Id"],
+                item.get("RequestedStartOffset"),
+            )
 
         self.set_item(current_file, item)
         data = {
@@ -125,10 +141,18 @@ class Player(xbmc.Player):
             "AudioStreamIndex": item["AudioStreamIndex"],
             "SubtitleStreamIndex": item["SubtitleStreamIndex"],
         }
-        try:
-            item["Server"].jellyfin.session_playing(data)
-        except Exception as e:
-            LOG.warning("Failed to report session playing: %s", e)
+        server = self.ensure_server(item)
+
+        if server is None:
+            LOG.info(
+                "Skipping session_playing for %s until Jellyfin reconnects.",
+                item["Id"],
+            )
+        else:
+            try:
+                server.jellyfin.session_playing(data)
+            except Exception as e:
+                LOG.warning("Failed to report session playing: %s", e)
         window("jellyfin.skip.%s.bool" % item["Id"], True)
         self.schedule_initial_seek(current_file)
 
@@ -171,6 +195,10 @@ class Player(xbmc.Player):
         volume = result.get("volume")
         muted = result.get("muted")
         current_position = item.get("CurrentPosition")
+        server = item.get("Server")
+
+        if server is None:
+            server = self.get_server_client(item.get("ServerId"))
 
         if current_position is None:
             current_position = int(seektime)
@@ -181,7 +209,7 @@ class Player(xbmc.Player):
                 "CurrentPosition": current_position,
                 "Muted": muted,
                 "Volume": volume,
-                "Server": Jellyfin(item["ServerId"]).get_client(),
+                "Server": server,
                 "Paused": False,
             }
         )
@@ -238,6 +266,126 @@ class Player(xbmc.Player):
         )
         worker.daemon = True
         worker.start()
+
+    @staticmethod
+    def get_server_client(server_id=None):
+        try:
+            return Jellyfin(server_id).get_client()
+        except Exception as error:
+            LOG.debug(
+                "Jellyfin client unavailable for %s: %s",
+                server_id or "default",
+                error,
+            )
+            return None
+
+    def ensure_server(self, item):
+        server = item.get("Server")
+
+        if server is not None:
+            return server
+
+        server = self.get_server_client(item.get("ServerId"))
+
+        if server is not None:
+            item["Server"] = server
+
+        return server
+
+    @classmethod
+    def clear_sleep_resume_candidate(cls):
+        window(cls.SLEEP_RESUME_STATE_KEY, clear=True)
+        window(cls.SLEEP_RESUME_ACTIVE_KEY, clear=True)
+
+    @classmethod
+    def serialize_sleep_resume_item(cls, item, current_position):
+        if current_position is None or int(current_position) <= 0:
+            return None
+
+        return {
+            "Type": item["Type"],
+            "Id": item["Id"],
+            "Path": item.get("Path") or item.get("File"),
+            "File": item.get("File") or item.get("Path"),
+            "PlayMethod": item["PlayMethod"],
+            "PlayOption": item.get("PlayOption", "Addon"),
+            "MediaSourceId": item["MediaSourceId"],
+            "Runtime": item["Runtime"],
+            "PlaySessionId": item["PlaySessionId"],
+            "ServerId": item.get("ServerId"),
+            "DeviceId": item.get("DeviceId"),
+            "SubsMapping": item.get("SubsMapping"),
+            "AudioStreamIndex": item.get("AudioStreamIndex"),
+            "SubtitleStreamIndex": item.get("SubtitleStreamIndex"),
+            "CurrentEpisode": item.get("CurrentEpisode"),
+            "CurrentPosition": int(current_position),
+            "ResumeIntent": playutils.RESUME_INTENT_RESUME,
+            "RequestedStartOffset": int(current_position),
+            "ForceInitialSeek": True,
+            "PromptSource": cls.SLEEP_RESUME_PROMPT_SOURCE,
+            "Muted": item.get("Muted", False),
+            "Volume": item.get("Volume", 100),
+            "Paused": False,
+        }
+
+    def build_sleep_resume_candidate(self):
+        if not self.played:
+            return None
+
+        current_file = self.get_playing_file()
+
+        if current_file and self.is_playing_file(current_file):
+            item = self.get_file_info(current_file)
+        elif len(self.played) == 1:
+            item = list(self.played.values())[0]
+        else:
+            return None
+
+        if not item or item.get("PlayOption") != "Addon":
+            return None
+
+        current_position = item.get("CurrentPosition")
+
+        if current_file and current_file == item.get("File"):
+            try:
+                current_position = int(self.getTime())
+            except Exception as error:
+                LOG.debug("Failed to refresh sleep resume position: %s", error)
+
+        return self.serialize_sleep_resume_item(item, current_position)
+
+    def store_sleep_resume_candidate(self):
+        candidate = self.build_sleep_resume_candidate()
+
+        if not candidate:
+            self.clear_sleep_resume_candidate()
+            return None
+
+        window(self.SLEEP_RESUME_STATE_KEY, candidate)
+        window(self.SLEEP_RESUME_ACTIVE_KEY, True)
+        LOG.info(
+            "Stored sleep resume candidate for %s at %s",
+            candidate["Id"],
+            candidate["RequestedStartOffset"],
+        )
+        return candidate
+
+    @classmethod
+    def recover_sleep_resume_item(cls, current_file):
+        if not window(cls.SLEEP_RESUME_ACTIVE_KEY):
+            return None
+
+        candidate = window(cls.SLEEP_RESUME_STATE_KEY)
+
+        if not candidate:
+            cls.clear_sleep_resume_candidate()
+            return None
+
+        if current_file not in (candidate.get("File"), candidate.get("Path")):
+            return None
+
+        cls.clear_sleep_resume_candidate()
+        return candidate
 
     def _apply_initial_seek(self, current_file, generation=None, monitor=None):
         if monitor is None:
@@ -437,7 +585,13 @@ class Player(xbmc.Player):
         if item["Type"] != "Episode" or not item.get("CurrentEpisode"):
             return
 
-        next_items = item["Server"].jellyfin.get_adjacent_episodes(
+        server = self.ensure_server(item)
+
+        if server is None:
+            LOG.info("Skipping next up while Jellyfin reconnects.")
+            return
+
+        next_items = server.jellyfin.get_adjacent_episodes(
             item["CurrentEpisode"]["tvshowid"], item["Id"]
         )
 
@@ -452,9 +606,7 @@ class Player(xbmc.Player):
                     return
 
                 break
-        server_address = item["Server"].auth.get_server_info(
-            item["Server"].auth.server_id
-        )["address"]
+        server_address = server.auth.get_server_info(server.auth.server_id)["address"]
         API = api.API(next_item, server_address)
         data = objects.map(next_item, "UpNext")
         artwork = API.get_all_artwork(objects.map(next_item, "ArtworkParent"), True)
@@ -584,7 +736,16 @@ class Player(xbmc.Player):
             "AudioStreamIndex": item["AudioStreamIndex"],
             "SubtitleStreamIndex": item["SubtitleStreamIndex"],
         }
-        item["Server"].jellyfin.session_progress(data)
+        server = self.ensure_server(item)
+
+        if server is None:
+            LOG.info(
+                "Skipping session_progress for %s until Jellyfin reconnects.",
+                item["Id"],
+            )
+            return
+
+        server.jellyfin.session_progress(data)
 
     def onPlayBackStopped(self):
         """Will be called when user stops playing a file."""
@@ -639,17 +800,25 @@ class Player(xbmc.Player):
                 "PositionTicks": int(item["CurrentPosition"] * 10000000),
                 "PlaySessionId": item["PlaySessionId"],
             }
-            item["Server"].jellyfin.session_stop(data)
+            server = self.ensure_server(item)
 
-            if item.get("LiveStreamId"):
+            if server is None:
+                LOG.info(
+                    "Skipping session_stop for %s because Jellyfin is offline.",
+                    item["Id"],
+                )
+            else:
+                server.jellyfin.session_stop(data)
+
+            if server is not None and item.get("LiveStreamId"):
 
                 LOG.info("<[ livestream/%s ]", item["LiveStreamId"])
-                item["Server"].jellyfin.close_live_stream(item["LiveStreamId"])
+                server.jellyfin.close_live_stream(item["LiveStreamId"])
 
-            elif item["PlayMethod"] == "Transcode":
+            elif server is not None and item["PlayMethod"] == "Transcode":
 
                 LOG.info("<[ transcode/%s ]", item["Id"])
-                item["Server"].jellyfin.close_transcode(
+                server.jellyfin.close_transcode(
                     item["DeviceId"], item["PlaySessionId"]
                 )
 
@@ -665,7 +834,12 @@ class Player(xbmc.Player):
                     if item["Id"] in file:
                         xbmcvfs.delete(os.path.join(path, file))
 
-            result = item["Server"].jellyfin.get_item(item["Id"]) or {}
+            server = self.ensure_server(item)
+
+            if server is None:
+                continue
+
+            result = server.jellyfin.get_item(item["Id"]) or {}
 
             if "UserData" in result and result["UserData"]["Played"]:
                 delete = False
@@ -684,7 +858,7 @@ class Player(xbmc.Player):
                     if dialog(
                         "yesno", translate(30091), translate(33015), autoclose=120000
                     ):
-                        item["Server"].jellyfin.delete_item(item["Id"])
+                        server.jellyfin.delete_item(item["Id"])
 
             window("jellyfin.external_check", clear=True)
 
@@ -705,7 +879,12 @@ class Player(xbmc.Player):
                 pass
             self.skip_dialog = None
 
-        segments = item["Server"].jellyfin.get_media_segments(item_id)
+        server = self.ensure_server(item)
+
+        if server is None:
+            return
+
+        segments = server.jellyfin.get_media_segments(item_id)
         if segments:
             segments = self._convert_media_segments(segments)
 
